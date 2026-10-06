@@ -26,6 +26,11 @@ USER_FORCE=0
 CREATE_USER="auto"
 ADD_SUDO=0          # --sudo : ajoute au groupe sudo le compte créé
 CREATE_NEW=0        # interne : le compte cible n'existe pas encore
+# Mot de passe du compte créé : soit fourni (--password/--password-stdin), soit
+# demandé sur le terminal, soit explicitement désactivé (--no-password).
+PASSWORD=""                 # valeur de --password (visible dans ps : avertissement)
+PASSWORD_STDIN=0            # --password-stdin : lu sur l'entrée standard
+NO_PASSWORD=0               # --no-password : compte verrouillé, clé SSH uniquement
 
 # [D] « Install using the apt repository », étape 2 (+ docker-ce-rootless-extras, [R] « With packages »).
 DOCKER_PKGS=(docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin docker-ce-rootless-extras)
@@ -80,6 +85,16 @@ Options :
   --create-user           Crée le compte s'il n'existe pas, sans demander.
   --no-create-user        Ne crée jamais de compte : échec clair s'il est absent.
   --sudo                  Si le compte est créé, l'ajouter au groupe sudo.
+  --password MDP          Mot de passe du compte créé. ATTENTION : cette valeur est
+                          visible dans « ps », l'historique du shell et les logs du
+                          système ; préférez --password-stdin ou la saisie masquée.
+  --password-stdin        Lit le mot de passe sur l'entrée standard (première ligne),
+                          sans qu'il apparaisse nulle part, par exemple :
+                            printf '%s\n' "\$MDP" | sudo ./docker-rootless.sh --user NOM --create-user --password-stdin
+  --no-password           Ne définit aucun mot de passe (compte verrouillé : connexion
+                          uniquement par clé SSH, sudo inutilisable).
+  Sans option de mot de passe, il est demandé sur le terminal à la création du compte
+  (saisie masquée, double vérification par passwd).
   --dry-run               Affiche tout ce qui serait fait (parties admin et
                           utilisateur) ; n'écrit rien, ne (re)démarre rien.
   --no-test               Ne lance pas « docker run --rm hello-world ».
@@ -428,6 +443,10 @@ while (( $# )); do
         --create-user) CREATE_USER="always" ;;
         --no-create-user) CREATE_USER="never" ;;
         --sudo)       ADD_SUDO=1 ;;
+        --password)   [[ $# -ge 2 ]] || die "--password attend une valeur"; PASSWORD="$2"; shift ;;
+        --password=*) PASSWORD="${1#--password=}" ;;
+        --password-stdin) PASSWORD_STDIN=1 ;;
+        --no-password) NO_PASSWORD=1 ;;
         --apt-suite)  [[ $# -ge 2 && -n "$2" ]] || die "--apt-suite attend un nom de suite"; APT_SUITE="$2"; shift ;;
         --apt-suite=*) APT_SUITE="${1#--apt-suite=}" ;;
         --print-user-script) user_script_content; exit 0 ;;
@@ -534,6 +553,33 @@ else
     die "Mode non interactif et compte cible ambigu (${HUMANS[*]}) : précisez --user NOM."
 fi
 
+# Source du mot de passe du compte à créer : paramètre, stdin, question, ou refus.
+# Résolu AVANT toute modification, pour ne jamais laisser un compte à moitié fait.
+PASSWORD_MODE=""
+if (( CREATE_NEW )); then
+    n_sources=0
+    [[ -n "$PASSWORD" ]] && n_sources=$((n_sources + 1))
+    if (( PASSWORD_STDIN )); then n_sources=$((n_sources + 1)); fi
+    if (( NO_PASSWORD )); then n_sources=$((n_sources + 1)); fi
+    if (( n_sources > 1 )); then
+        die "Options de mot de passe contradictoires : choisissez --password, --password-stdin ou --no-password."
+    fi
+    if [[ -n "$PASSWORD" ]]; then
+        PASSWORD_MODE=param
+        [[ "$PASSWORD" == *$'\n'* || "$PASSWORD" == *$'\r'* ]] && die "Le mot de passe ne doit pas contenir de retour à la ligne."
+        (( ${#PASSWORD} < 8 )) && warn "Mot de passe court (${#PASSWORD} caractères) : 8 minimum recommandé."
+        warn "--password : la valeur est visible dans 'ps' pendant l'exécution, dans l'historique du shell et dans les journaux. Préférez --password-stdin ou la saisie demandée."
+    elif (( PASSWORD_STDIN )); then
+        PASSWORD_MODE=stdin
+    elif (( NO_PASSWORD )); then
+        PASSWORD_MODE=none
+    elif [[ -t 0 || -t 2 ]]; then
+        PASSWORD_MODE=prompt
+    else
+        die "Compte $TARGET_USER à créer : aucun mot de passe possible en non-interactif. Utilisez --password-stdin (recommandé), --password MDP, ou --no-password."
+    fi
+fi
+
 if (( CREATE_NEW )); then
     step "0. Compte $TARGET_USER"
     log "Création du compte (adduser --disabled-password) : aucun mot de passe, SSH reste à votre main."
@@ -555,8 +601,43 @@ if (( CREATE_NEW )); then
         user_exists "$TARGET_USER" || die "Création de $TARGET_USER échouée."
         log "Compte créé : $TARGET_USER (uid $(id -u "$TARGET_USER"))"
     fi
-    if (( ! ADD_SUDO )); then
-        warn "Ce compte n'a ni mot de passe ni clé SSH : ajoutez une clé depuis root (ou via votre outil de durcissement) avant de compter vous y connecter."
+    case "$PASSWORD_MODE" in
+        param)
+            if (( DRY_RUN )); then
+                printf '[+] (dry-run) chpasswd (mot de passe non affiché)\n'
+            else
+                printf '%s:%s\n' "$TARGET_USER" "$PASSWORD" | chpasswd
+                log "Mot de passe défini pour $TARGET_USER (valeur non journalisée)."
+            fi
+            PASSWORD="" ;;
+        stdin)
+            if (( DRY_RUN )); then
+                printf '[+] (dry-run) chpasswd avec le mot de passe lu sur stdin (non affiché)\n'
+            else
+                IFS= read -r _pw || _pw=""
+                [[ -n "$_pw" ]] || die "Entrée standard vide : aucun mot de passe reçu (--password-stdin)."
+                printf '%s:%s\n' "$TARGET_USER" "$_pw" | chpasswd
+                unset _pw
+                log "Mot de passe défini pour $TARGET_USER (lu sur stdin, non journalisé)."
+            fi ;;
+        prompt)
+            if (( DRY_RUN )); then
+                printf '[+] (dry-run) passwd %s (saisie masquée sur le terminal)\n' "$TARGET_USER"
+            else
+                log "Définissez le mot de passe de $TARGET_USER (saisie masquée, jamais affichée) :"
+                passwd "$TARGET_USER"
+            fi ;;
+        none)
+            warn "Aucun mot de passe (--no-password) : $TARGET_USER est verrouillé pour l'authentification par mot de passe."
+            warn "Connexion uniquement par clé SSH ; sudo sera inutilisable pour ce compte tant qu'aucun mot de passe n'est défini." ;;
+    esac
+
+    if [[ -n "$PASSWORD" ]]; then
+        unset PASSWORD
+    fi
+
+    if (( ! ADD_SUDO )) || [[ "$PASSWORD_MODE" == none ]]; then
+        warn "Ajoutez une clé SSH à $TARGET_USER (depuis root) avant de compter vous y connecter."
     fi
 fi
 
@@ -828,7 +909,14 @@ fi
 step "Récapitulatif"
 # ---------------------------------------------------------------------------
 created_note=""
-if (( CREATE_NEW )); then created_note=" — compte créé par ce script"; fi
+if (( CREATE_NEW )); then
+    case "$PASSWORD_MODE" in
+        none) pw_note="aucun (compte verrouillé, clé SSH uniquement)" ;;
+        "")   pw_note="non modifié" ;;
+        *)    pw_note="défini (non journalisé)" ;;
+    esac
+    created_note=" — compte créé par ce script, mot de passe : $pw_note"
+fi
 cat <<EOF
 [+] Compte          : $TARGET_USER (uid $TARGET_UID)$created_note
 [+] Socket          : $SOCK

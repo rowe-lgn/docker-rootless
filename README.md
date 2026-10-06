@@ -24,8 +24,9 @@ Sources (documentation officielle Docker), citées dans les commentaires des scr
 # Choisir le compte explicitement (obligatoire en non-interactif s'il y a plusieurs comptes)
 sudo ./docker-rootless.sh --user admin
 
-# Machine neuve : créer le compte au passage (la question est aussi posée à l'interactif)
-sudo ./docker-rootless.sh --user admin --create-user --sudo
+# Machine neuve : créer le compte au passage (la question est aussi posée à l'interactif).
+# Le mot de passe est demandé sur le terminal ; en script, passez-le par stdin :
+printf '%s\n' "$MDP" | sudo ./docker-rootless.sh --user admin --create-user --sudo --password-stdin
 
 # Voir tout ce qui serait fait, sans rien écrire ni redémarrer (les deux parties)
 ./docker-rootless.sh --dry-run
@@ -43,11 +44,30 @@ listé dans `/etc/shells` (ni `nologin` ni `false`).
 
 Si `--user` désigne un compte **inexistant**, le script propose de le créer (question posée
 sur le terminal, réponse par défaut : non). En non-interactif il faut `--create-user` ;
-`--no-create-user` refuse explicitement. Le compte est créé par `adduser
---disabled-password` : aucun mot de passe et aucune clé SSH — à vous d'ajouter une clé avant
-de compter vous y connecter. `--sudo` l'ajoute au groupe `sudo` (non fait par défaut, pour ne
-pas élever les privilèges sans le dire). En `--dry-run` le compte n'est pas créé : l'UID
-affiché est une estimation et la partie utilisateur n'est pas simulée pour un compte absent.
+`--no-create-user` refuse explicitement. Le compte est créé par `adduser --disabled-password`
+et **aucune clé SSH n'est ajoutée** : à vous de le faire avant de compter vous y connecter.
+
+**Mot de passe du compte créé** — une source est obligatoire, résolue avant toute
+modification pour ne jamais laisser un compte à moitié fait :
+
+- par défaut, il est **demandé sur le terminal** (saisie masquée, double vérification) ;
+- `--password-stdin` le lit sur l'entrée standard — la forme recommandée en non-interactif,
+  la valeur n'apparaît nulle part ;
+- `--password MDP` l'accepte en paramètre : **déconseillé**, la valeur est visible dans
+  `ps` pendant l'exécution, dans l'historique du shell et dans les journaux ;
+- `--no-password` n'en définit aucun : le compte est verrouillé, connexion uniquement par
+  clé SSH et `sudo` inutilisable pour lui.
+
+En non-interactif, sans option de mot de passe, le script s'arrête **avant** de créer quoi que
+ce soit. Le mot de passe n'est jamais journalisé ni affiché (récapitulatif : « défini » /
+« aucun »).
+
+`--sudo` ajoute le compte créé au groupe `sudo` (non fait par défaut, pour ne pas élever les
+privilèges sans le dire) ; il faut alors un mot de passe (ou une règle `NOPASSWD`) pour que
+`sudo` soit réellement utilisable.
+
+En `--dry-run` le compte n'est pas créé : l'UID affiché est une estimation, le mot de passe
+n'est pas demandé, et la partie utilisateur n'est pas simulée pour un compte absent.
 
 ### Options de `docker-rootless.sh`
 
@@ -57,6 +77,9 @@ affiché est une estimation et la partie utilisateur n'est pas simulée pour un 
 | `--create-user` | Crée le compte manquant sans demander. |
 | `--no-create-user` | Ne crée jamais de compte : erreur claire s'il est absent. |
 | `--sudo` | Si le compte est créé, l'ajouter au groupe `sudo` (non fait par défaut). |
+| `--password MDP` | Mot de passe du compte créé, en paramètre (déconseillé : visible dans `ps`, l'historique et les journaux). |
+| `--password-stdin` | Lit le mot de passe sur l'entrée standard (recommandé en non-interactif). |
+| `--no-password` | Aucun mot de passe : compte verrouillé, clé SSH uniquement, `sudo` inutilisable. |
 | `--dry-run` | Affiche toutes les actions (admin + utilisateur) ; n'écrit rien, ne démarre rien. Sans root, il fait une inspection en lecture seule sans `sudo`. |
 | `--no-test` | Ne lance pas `docker run --rm hello-world` (utile hors ligne). |
 | `--keep-rootful-docker` | Ne désactive pas `docker.service`/`docker.socket` ; le setuptool est lancé avec `--force`. |
