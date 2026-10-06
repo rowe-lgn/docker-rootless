@@ -24,6 +24,9 @@ Sources (documentation officielle Docker), citées dans les commentaires des scr
 # Choisir le compte explicitement (obligatoire en non-interactif s'il y a plusieurs comptes)
 sudo ./docker-rootless.sh --user admin
 
+# Machine neuve : créer le compte au passage (la question est aussi posée à l'interactif)
+sudo ./docker-rootless.sh --user admin --create-user --sudo
+
 # Voir tout ce qui serait fait, sans rien écrire ni redémarrer (les deux parties)
 ./docker-rootless.sh --dry-run
 
@@ -38,11 +41,22 @@ script s'arrête avec `[x] Mode non interactif et compte cible ambigu … : pré
 Un « compte humain » a un UID entre `UID_MIN` et `UID_MAX` (`/etc/login.defs`) et un shell
 listé dans `/etc/shells` (ni `nologin` ni `false`).
 
+Si `--user` désigne un compte **inexistant**, le script propose de le créer (question posée
+sur le terminal, réponse par défaut : non). En non-interactif il faut `--create-user` ;
+`--no-create-user` refuse explicitement. Le compte est créé par `adduser
+--disabled-password` : aucun mot de passe et aucune clé SSH — à vous d'ajouter une clé avant
+de compter vous y connecter. `--sudo` l'ajoute au groupe `sudo` (non fait par défaut, pour ne
+pas élever les privilèges sans le dire). En `--dry-run` le compte n'est pas créé : l'UID
+affiché est une estimation et la partie utilisateur n'est pas simulée pour un compte absent.
+
 ### Options de `docker-rootless.sh`
 
 | Option | Effet |
 |---|---|
-| `--user NOM` | Compte cible. |
+| `--user NOM` | Compte cible ; s'il n'existe pas, sa création est proposée. |
+| `--create-user` | Crée le compte manquant sans demander. |
+| `--no-create-user` | Ne crée jamais de compte : erreur claire s'il est absent. |
+| `--sudo` | Si le compte est créé, l'ajouter au groupe `sudo` (non fait par défaut). |
 | `--dry-run` | Affiche toutes les actions (admin + utilisateur) ; n'écrit rien, ne démarre rien. Sans root, il fait une inspection en lecture seule sans `sudo`. |
 | `--no-test` | Ne lance pas `docker run --rm hello-world` (utile hors ligne). |
 | `--keep-rootful-docker` | Ne désactive pas `docker.service`/`docker.socket` ; le setuptool est lancé avec `--force`. |

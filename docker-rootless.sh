@@ -21,6 +21,11 @@ NO_TEST=0
 KEEP_ROOTFUL=0
 APT_SUITE=""
 USER_FORCE=0
+# Création du compte cible : auto = proposer si un terminal est disponible,
+# toujours = créer sans demander, jamais = refuser (défaut : auto).
+CREATE_USER="auto"
+ADD_SUDO=0          # --sudo : ajoute au groupe sudo le compte créé
+CREATE_NEW=0        # interne : le compte cible n'existe pas encore
 
 # [D] « Install using the apt repository », étape 2 (+ docker-ce-rootless-extras, [R] « With packages »).
 DOCKER_PKGS=(docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin docker-ce-rootless-extras)
@@ -70,7 +75,11 @@ Lancé en non-root, le script se ré-élève via sudo.
 
 Options :
   --user NOM              Compte cible (défaut : \$SUDO_USER, sinon l'unique
-                          compte humain, sinon choix interactif).
+                          compte humain, sinon choix interactif). S'il n'existe
+                          pas, sa création est proposée (voir --create-user).
+  --create-user           Crée le compte s'il n'existe pas, sans demander.
+  --no-create-user        Ne crée jamais de compte : échec clair s'il est absent.
+  --sudo                  Si le compte est créé, l'ajouter au groupe sudo.
   --dry-run               Affiche tout ce qui serait fait (parties admin et
                           utilisateur) ; n'écrit rien, ne (re)démarre rien.
   --no-test               Ne lance pas « docker run --rm hello-world ».
@@ -416,6 +425,9 @@ while (( $# )); do
         --dry-run)    DRY_RUN=1 ;;
         --no-test)    NO_TEST=1 ;;
         --keep-rootful-docker) KEEP_ROOTFUL=1 ;;
+        --create-user) CREATE_USER="always" ;;
+        --no-create-user) CREATE_USER="never" ;;
+        --sudo)       ADD_SUDO=1 ;;
         --apt-suite)  [[ $# -ge 2 && -n "$2" ]] || die "--apt-suite attend un nom de suite"; APT_SUITE="$2"; shift ;;
         --apt-suite=*) APT_SUITE="${1#--apt-suite=}" ;;
         --print-user-script) user_script_content; exit 0 ;;
@@ -462,9 +474,42 @@ human_users() {
 }
 mapfile -t HUMANS < <(human_users)
 is_human() { local u; for u in "${HUMANS[@]}"; do [[ "$u" == "$1" ]] && return 0; done; return 1; }
+user_exists() { getent passwd "$1" >/dev/null 2>&1; }
+valid_name()  { [[ "$1" =~ ^[a-z_][a-z0-9_-]*$ ]]; }
+# Premier UID libre à partir d'UID_MIN : utilisé en --dry-run, avant la création.
+next_free_uid() {
+    local min u
+    min="$(awk '$1=="UID_MIN"{print $2}' /etc/login.defs 2>/dev/null)"; min="${min:-1000}"
+    u="$min"
+    while getent passwd "$u" >/dev/null 2>&1; do u=$((u + 1)); done
+    printf '%s' "$u"
+}
 
 if [[ -n "$TARGET_USER" ]]; then
-    is_human "$TARGET_USER" || die "--user '$TARGET_USER' n'est pas un compte humain valide (choix : ${HUMANS[*]:-aucun})."
+    if ! user_exists "$TARGET_USER"; then
+        # Nom inconnu : création possible (voir --create-user / --no-create-user).
+        valid_name "$TARGET_USER" || die "--user '$TARGET_USER' : nom de compte invalide (attendu : [a-z_][a-z0-9_-]*)."
+        case "$CREATE_USER" in
+            never)
+                die "Le compte '$TARGET_USER' n'existe pas et --no-create-user interdit sa création." ;;
+            always)
+                CREATE_NEW=1 ;;
+            *)
+                if [[ -t 0 || -t 2 ]] && { exec 3</dev/tty; } 2>/dev/null; then
+                    printf "[!] Le compte %s n'existe pas. Le créer (adduser, sans mot de passe) ? [o/N] " "$TARGET_USER" >&2
+                    IFS= read -r rep <&3 || rep=""
+                    exec 3<&-
+                    case "$rep" in
+                        o|O|oui|Oui|OUI|y|Y|yes) CREATE_NEW=1 ;;
+                        *) die "Création refusée. Créez le compte (adduser $TARGET_USER) puis relancez, ou utilisez --create-user." ;;
+                    esac
+                else
+                    die "Le compte '$TARGET_USER' n'existe pas. Relancez avec --create-user pour le créer, ou créez-le d'abord (adduser $TARGET_USER)."
+                fi ;;
+        esac
+    elif ! is_human "$TARGET_USER"; then
+        die "--user '$TARGET_USER' existe mais n'est pas un compte humain (choix : ${HUMANS[*]:-aucun})."
+    fi
 elif [[ -n "${SUDO_USER:-}" ]] && is_human "$SUDO_USER"; then
     TARGET_USER="$SUDO_USER"; log "Compte cible déduit de \$SUDO_USER : $TARGET_USER"
 elif (( EUID != 0 )) && is_human "$(id -un)"; then
@@ -489,8 +534,39 @@ else
     die "Mode non interactif et compte cible ambigu (${HUMANS[*]}) : précisez --user NOM."
 fi
 
-IFS=: read -r _ _ TARGET_UID TARGET_GID _ TARGET_HOME TARGET_SHELL < <(getent passwd "$TARGET_USER")
-[[ -d "$TARGET_HOME" ]] || die "Répertoire personnel de $TARGET_USER introuvable : $TARGET_HOME"
+if (( CREATE_NEW )); then
+    step "0. Compte $TARGET_USER"
+    log "Création du compte (adduser --disabled-password) : aucun mot de passe, SSH reste à votre main."
+    if (( DRY_RUN )); then
+        printf "[+] (dry-run) adduser --disabled-password --gecos '' %s\n" "$TARGET_USER"
+    else
+        adduser --disabled-password --gecos "" "$TARGET_USER"
+    fi
+    if (( ADD_SUDO )); then
+        log "Ajout de $TARGET_USER au groupe sudo."
+        run usermod -aG sudo "$TARGET_USER"
+    fi
+    if (( DRY_RUN )); then
+        TARGET_UID="$(next_free_uid)"
+        TARGET_HOME="/home/$TARGET_USER"
+        TARGET_SHELL=/bin/bash
+        warn "(dry-run) compte non créé : uid $TARGET_UID estimé, HOME supposé $TARGET_HOME."
+    else
+        user_exists "$TARGET_USER" || die "Création de $TARGET_USER échouée."
+        log "Compte créé : $TARGET_USER (uid $(id -u "$TARGET_USER"))"
+    fi
+    if (( ! ADD_SUDO )); then
+        warn "Ce compte n'a ni mot de passe ni clé SSH : ajoutez une clé depuis root (ou via votre outil de durcissement) avant de compter vous y connecter."
+    fi
+fi
+
+if (( CREATE_NEW && DRY_RUN )); then
+    : # uid et HOME estimés ci-dessus : la lecture réelle est impossible avant création
+else
+    IFS=: read -r _ _ TARGET_UID TARGET_GID _ TARGET_HOME TARGET_SHELL < <(getent passwd "$TARGET_USER")
+    [[ -n "${TARGET_UID:-}" ]] || die "Compte $TARGET_USER introuvable."
+    [[ -d "$TARGET_HOME" ]] || die "Répertoire personnel de $TARGET_USER introuvable : $TARGET_HOME"
+fi
 RUNTIME_DIR="/run/user/$TARGET_UID"
 SOCK="$RUNTIME_DIR/docker.sock"
 USER_SCRIPT_DEST="$TARGET_HOME/.local/bin/$USER_SCRIPT_NAME"
@@ -721,7 +797,9 @@ user_rc=0
 if (( DRY_RUN )); then
     log "(dry-run) installation de $USER_SCRIPT_DEST (propriétaire $TARGET_USER, mode 0755)"
     # Exécution du script embarqué sans rien écrire sur disque.
-    if (( EUID == 0 )); then
+    if (( CREATE_NEW )); then
+        warn "(dry-run) compte $TARGET_USER inexistant : partie utilisateur non simulée (elle s'exécutera après la création réelle)."
+    elif (( EUID == 0 )); then
         log "(dry-run) exécution de la partie utilisateur sous $TARGET_USER :"
         "$RUNUSER" -u "$TARGET_USER" -- "${user_env[@]}" bash -c "$(user_script_content)" "$USER_SCRIPT_NAME" "${user_args[@]}" || user_rc=$?
     elif [[ "$(id -un)" == "$TARGET_USER" ]]; then
@@ -749,8 +827,10 @@ fi
 # ---------------------------------------------------------------------------
 step "Récapitulatif"
 # ---------------------------------------------------------------------------
+created_note=""
+if (( CREATE_NEW )); then created_note=" — compte créé par ce script"; fi
 cat <<EOF
-[+] Compte          : $TARGET_USER (uid $TARGET_UID)
+[+] Compte          : $TARGET_USER (uid $TARGET_UID)$created_note
 [+] Socket          : $SOCK
 [+] DOCKER_HOST     : unix://$SOCK   (ajouté à ~/.bashrc et ~/.profile)
 [+] Script user     : $USER_SCRIPT_DEST
