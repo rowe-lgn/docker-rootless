@@ -413,7 +413,10 @@ fail=0
 # Contexte CLI : le setuptool crée et sélectionne « rootless ». DOCKER_HOST, s'il
 # est défini, prime sur le contexte (le CLI afficherait alors « default ») : on
 # l'enlève pour contrôler le contexte, puis on interroge explicitement le socket.
-ctx="$(env -u DOCKER_HOST docker info 2>/dev/null | awk -F': ' '/^ *Context:/{print $2; exit}')"
+# `docker info` aligne la valeur avec des espaces : on les retire, sinon la
+# comparaison echoue alors que le contexte est correct («    rootless »).
+ctx="$(env -u DOCKER_HOST docker info 2>/dev/null \
+    | awk -F: '/^[[:space:]]*Context:/{gsub(/^[[:space:]]+|[[:space:]]+$/,"",$2); print $2; exit}')"
 if [[ "$ctx" == "rootless" ]]; then
     log "docker info : Context: rootless"
 else
