@@ -21,12 +21,16 @@ Sources (documentation officielle Docker), citées dans les commentaires des scr
 # Le cas normal : depuis le compte qui utilisera Docker (sudo demande le mot de passe)
 ./docker-rootless.sh
 
+# Mode guidé : en root sur une machine neuve, ce qui manque est demandé
+# (compte, création, mot de passe, clé SSH, groupe sudo), puis confirmé
+sudo ./docker-rootless.sh
+
 # Choisir le compte explicitement (obligatoire en non-interactif s'il y a plusieurs comptes)
 sudo ./docker-rootless.sh --user admin
 
-# Machine neuve : créer le compte au passage (la question est aussi posée à l'interactif).
-# Le mot de passe est demandé sur le terminal ; en script, passez-le par stdin :
-printf '%s\n' "$MDP" | sudo ./docker-rootless.sh --user admin --create-user --sudo --password-stdin
+# Machine neuve, tout fourni : aucune question. En script, mot de passe par stdin :
+printf '%s\n' "$MDP" | sudo ./docker-rootless.sh --user admin --create-user --sudo \
+    --password-stdin --ssh-key ~/.ssh/id_ed25519.pub --yes
 
 # Voir tout ce qui serait fait, sans rien écrire ni redémarrer (les deux parties)
 ./docker-rootless.sh --dry-run
@@ -35,22 +39,69 @@ printf '%s\n' "$MDP" | sudo ./docker-rootless.sh --user admin --create-user --su
 ~/.local/bin/docker-rootless-user.sh
 ```
 
+### Mode guidé : « soit tout est fourni, soit on vous demande »
+
+- **Tout est fourni** par les options : aucune question, exécution directe.
+- **Il manque une valeur et un terminal est disponible** : elle est demandée, la valeur
+  par défaut entre crochets (`[o/N]`, `[O/n]` : la majuscule est le défaut, `Entrée`
+  l'accepte). Les questions sont lues sur `/dev/tty`, jamais sur l'entrée standard (qui
+  peut porter `--password-stdin`).
+- **Sans terminal** : auto-détection quand elle existe, sinon arrêt net avec un message qui
+  dit quelle option passer. Aucune valeur n'est inventée.
+- **`--yes` (`-y`)** : aucune question ni confirmation, valeurs par défaut retenues (pour
+  l'automatisation). Les défauts restent prudents : pas de création de compte sans
+  `--create-user`, pas de clé SSH ni de groupe `sudo` sans option ; seul le mot de passe
+  d'un compte créé, sans option de mot de passe, est saisi par `passwd` si un terminal
+  existe (sinon arrêt, comme sans `--yes`).
+
+Questions posées, uniquement si la réponse manque, dans cet ordre :
+
+1. **Compte cible** — si ni `--user`, ni `$SUDO_USER`, ni compte unique ne le détermine :
+   liste numérotée des comptes humains, ou saisie d'un nom (un nom nouveau mène à la
+   question suivante).
+2. **Création** — « Le compte X n'existe pas. Le créer (adduser) ? [o/N] ».
+3. **Mot de passe** du compte créé — « Définir un mot de passe maintenant ? [O/n] » : oui =
+   saisie masquée par `passwd` ; non = compte verrouillé (clé SSH uniquement, `sudo`
+   inutilisable). Supprimée par `--password`, `--password-stdin` ou `--no-password`.
+4. **Clé SSH** du compte créé — « Ajouter une clé SSH publique ? [o/N] », puis collez la clé
+   (`ssh-ed25519 AAAA…`) ou donnez le chemin d'un fichier `.pub` (`~` = le HOME de
+   l'administrateur qui a lancé `sudo`). Supprimée par `--ssh-key`.
+5. **Groupe sudo** du compte créé — « Ajouter au groupe sudo ? [o/N] ». Supprimée par `--sudo`.
+
+Ensuite, si au moins une question a été posée, un **récapitulatif** des choix est affiché
+et « Appliquer ? [O/n] » est demandé ; `n` arrête le script avant toute modification. En
+`--dry-run`, les questions sont posées (elles alimentent la simulation) mais rien n'est écrit.
+
+### Compte cible
+
 Choix du compte cible, dans l'ordre : `--user NOM` → `$SUDO_USER` s'il est un compte
 humain → l'utilisateur courant (dry-run sans root) → l'unique compte humain s'il n'y en a
-qu'un → liste numérotée lue sur le terminal. Sans terminal et sans choix possible, le
-script s'arrête avec `[x] Mode non interactif et compte cible ambigu … : précisez --user NOM.`
+qu'un → question sur le terminal (liste numérotée ou nom). Sans terminal et sans choix
+possible, le script s'arrête avec `[x] Mode non interactif et compte cible ambigu … : précisez --user NOM.`
 Un « compte humain » a un UID entre `UID_MIN` et `UID_MAX` (`/etc/login.defs`) et un shell
 listé dans `/etc/shells` (ni `nologin` ni `false`).
 
-Si `--user` désigne un compte **inexistant**, le script propose de le créer (question posée
+Si le compte désigné est **inexistant**, le script propose de le créer (question posée
 sur le terminal, réponse par défaut : non). En non-interactif il faut `--create-user` ;
-`--no-create-user` refuse explicitement. Le compte est créé par `adduser --disabled-password`
-et **aucune clé SSH n'est ajoutée** : à vous de le faire avant de compter vous y connecter.
+`--no-create-user` refuse explicitement. Le compte est créé par `adduser --disabled-password`.
+
+**Clé SSH du compte créé** — fournie par `--ssh-key` ou à la question : collage sur une
+ligne, collage coupé en plusieurs lignes (recollé automatiquement), ou chemin d'un `.pub`.
+Le format est vérifié (`ssh-ed25519`, `ssh-rsa`, `ecdsa-sha2-*`, `sk-ssh-*`/`sk-ecdsa-*`,
+suivi d'un base64 dont le contenu doit correspondre au type annoncé) ; une clé tronquée,
+une clé privée ou un autre texte est refusé avec un message et la question est reposée.
+La clé est ajoutée à `~/.ssh/authorized_keys` **en tant que l'utilisateur** (`~/.ssh` en
+0700, fichier en 0600), sans doublon (ligne entière comparée). Elle n'est installée que sur
+un compte **créé par ce script** : l'accès d'un compte existant n'est jamais modifié
+(`--ssh-key` est alors ignorée avec un avertissement). En `--dry-run`, la clé et le chemin
+sont affichés (une clé publique n'est pas un secret), rien n'est écrit. Sans clé, pensez à
+en ajouter une avant de compter vous connecter au compte.
 
 **Mot de passe du compte créé** — une source est obligatoire, résolue avant toute
 modification pour ne jamais laisser un compte à moitié fait :
 
-- par défaut, il est **demandé sur le terminal** (saisie masquée, double vérification) ;
+- par défaut, il est **demandé sur le terminal** (question « Définir un mot de passe
+  maintenant ? [O/n] », puis saisie masquée avec double vérification) ;
 - `--password-stdin` le lit sur l'entrée standard — la forme recommandée en non-interactif,
   la valeur n'apparaît nulle part ;
 - `--password MDP` l'accepte en paramètre : **déconseillé**, la valeur est visible dans
@@ -62,12 +113,13 @@ En non-interactif, sans option de mot de passe, le script s'arrête **avant** de
 ce soit. Le mot de passe n'est jamais journalisé ni affiché (récapitulatif : « défini » /
 « aucun »).
 
-`--sudo` ajoute le compte créé au groupe `sudo` (non fait par défaut, pour ne pas élever les
-privilèges sans le dire) ; il faut alors un mot de passe (ou une règle `NOPASSWD`) pour que
-`sudo` soit réellement utilisable.
+`--sudo` (ou « oui » à la question) ajoute le compte créé au groupe `sudo` (non fait par
+défaut, pour ne pas élever les privilèges sans le dire) ; il faut alors un mot de passe (ou
+une règle `NOPASSWD`) pour que `sudo` soit réellement utilisable.
 
 En `--dry-run` le compte n'est pas créé : l'UID affiché est une estimation, le mot de passe
-n'est pas demandé, et la partie utilisateur n'est pas simulée pour un compte absent.
+n'est pas saisi (les questions, elles, sont posées), et la partie utilisateur n'est pas
+simulée pour un compte absent.
 
 ### Options de `docker-rootless.sh`
 
@@ -80,6 +132,8 @@ n'est pas demandé, et la partie utilisateur n'est pas simulée pour un compte a
 | `--password MDP` | Mot de passe du compte créé, en paramètre (déconseillé : visible dans `ps`, l'historique et les journaux). |
 | `--password-stdin` | Lit le mot de passe sur l'entrée standard (recommandé en non-interactif). |
 | `--no-password` | Aucun mot de passe : compte verrouillé, clé SSH uniquement, `sudo` inutilisable. |
+| `--ssh-key CLÉ\|FICHIER` | Clé publique SSH (texte ou fichier `.pub`) installée dans `~/.ssh/authorized_keys` du compte **créé** ; ignorée pour un compte existant. |
+| `-y`, `--yes` | Aucune question ni confirmation : valeurs par défaut retenues (automatisation). |
 | `--dry-run` | Affiche toutes les actions (admin + utilisateur) ; n'écrit rien, ne démarre rien. Sans root, il fait une inspection en lecture seule sans `sudo`. |
 | `--no-test` | Ne lance pas `docker run --rm hello-world` (utile hors ligne). |
 | `--keep-rootful-docker` | Ne désactive pas `docker.service`/`docker.socket` ; le setuptool est lancé avec `--force`. |
@@ -95,7 +149,7 @@ Security Options, hello-world) ; `1` = échec ; `2` = session systemd utilisateu
 `docker-rootless.sh` renvoie le code de la partie utilisateur et imprime toujours un
 récapitulatif (compte, socket, `DOCKER_HOST`, commandes de vérification).
 
-Journalisation : `[+]` information/action, `[!]` avertissement, `[x]` erreur.
+Journalisation : `[+]` information/action, `[?]` question, `[!]` avertissement, `[x]` erreur.
 
 ## Ce que fait chaque étape
 

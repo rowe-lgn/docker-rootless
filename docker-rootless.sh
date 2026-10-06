@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # docker-rootless.sh — installation Docker en mode ROOTLESS sur Debian, point d'entrée unique.
 #
-#   ./docker-rootless.sh [--user NOM] [--dry-run] [--no-test] [--keep-rootful-docker]
+#   ./docker-rootless.sh [--user NOM] [--yes] [--dry-run] [--no-test] [--keep-rootful-docker]
 #
 # Fait la partie ADMIN (root, ré-élévation sudo automatique), puis installe et
 # exécute la partie UTILISATEUR (docker-rootless-user.sh, embarquée plus bas)
@@ -31,6 +31,13 @@ CREATE_NEW=0        # interne : le compte cible n'existe pas encore
 PASSWORD=""                 # valeur de --password (visible dans ps : avertissement)
 PASSWORD_STDIN=0            # --password-stdin : lu sur l'entrée standard
 NO_PASSWORD=0               # --no-password : compte verrouillé, clé SSH uniquement
+# Mode guidé : ce qui manque est demandé sur le terminal (fd 3 = /dev/tty) ;
+# --yes n'interroge jamais et retient les valeurs par défaut.
+ASSUME_YES=0        # --yes / -y
+INTERACTIVE=0       # interne : 1 = questions possibles
+ASKED=0             # interne : nombre de questions posées (récapitulatif si > 0)
+SSH_KEY=""          # clé publique à installer sur le compte créé (pas un secret)
+SSH_KEY_ARG=""      # --ssh-key : clé ou chemin de fichier .pub (supprime la question)
 
 # [D] « Install using the apt repository », étape 2 (+ docker-ce-rootless-extras, [R] « With packages »).
 DOCKER_PKGS=(docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin docker-ce-rootless-extras)
@@ -95,7 +102,16 @@ Options :
                           uniquement par clé SSH, sudo inutilisable).
   Sans option de mot de passe, il est demandé sur le terminal à la création du compte
   (saisie masquée, double vérification par passwd).
-  --dry-run               Affiche tout ce qui serait fait (parties admin et
+  --ssh-key CLÉ|FICHIER   Clé publique SSH (« ssh-ed25519 AAAA… » ou fichier .pub) à
+                          installer dans ~/.ssh/authorized_keys du compte CRÉÉ
+                          (ignorée pour un compte existant).
+  -y, --yes               Aucune question : valeurs par défaut retenues, pas de
+                          confirmation (automatisation). Ne crée pas de compte sans
+                          --create-user et n'invente aucune valeur.
+  Mode guidé : avec un terminal, ce qui manque (compte, création, mot de passe, clé
+  SSH du compte créé, groupe sudo) est demandé, défaut entre crochets (Entrée =
+  défaut), puis un récapitulatif est soumis à confirmation avant toute modification.
+  --dry-run              Affiche tout ce qui serait fait (parties admin et
                           utilisateur) ; n'écrit rien, ne (re)démarre rien.
   --no-test               Ne lance pas « docker run --rm hello-world ».
   --keep-rootful-docker   Ne désactive pas le Docker rootful (docker.service) ;
@@ -447,7 +463,10 @@ while (( $# )); do
         --password=*) PASSWORD="${1#--password=}" ;;
         --password-stdin) PASSWORD_STDIN=1 ;;
         --no-password) NO_PASSWORD=1 ;;
-        --apt-suite)  [[ $# -ge 2 && -n "$2" ]] || die "--apt-suite attend un nom de suite"; APT_SUITE="$2"; shift ;;
+        -y|--yes)     ASSUME_YES=1 ;;
+        --ssh-key)    [[ $# -ge 2 && -n "$2" ]] || die "--ssh-key attend une clé publique ou un fichier .pub"; SSH_KEY_ARG="$2"; shift ;;
+        --ssh-key=*)  SSH_KEY_ARG="${1#--ssh-key=}" ;;
+        --apt-suite) [[ $# -ge 2 && -n "$2" ]] || die "--apt-suite attend un nom de suite"; APT_SUITE="$2"; shift ;;
         --apt-suite=*) APT_SUITE="${1#--apt-suite=}" ;;
         --print-user-script) user_script_content; exit 0 ;;
         -h|--help)    usage; exit 0 ;;
@@ -504,28 +523,219 @@ next_free_uid() {
     printf '%s' "$u"
 }
 
+# ---------------------------------------------------------------------------
+# Questions (mode guidé) : lues sur le terminal, jamais sur stdin (qui peut
+# porter --password-stdin). Rien n'est demandé avec --yes ni sans terminal.
+# ---------------------------------------------------------------------------
+if (( ! ASSUME_YES )) && [[ -t 0 || -t 2 ]] && { exec 3</dev/tty; } 2>/dev/null; then
+    INTERACTIVE=1
+fi
+
+trim() {
+    local s="${1//$'\r'/}"
+    s="${s#"${s%%[![:space:]]*}"}"
+    s="${s%"${s##*[![:space:]]}"}"
+    printf '%s' "$s"
+}
+
+# ask_yn QUESTION o|n : succès si oui. Entrée = défaut (en majuscule entre crochets).
+ask_yn() {
+    local q="$1" def="$2" hint rep
+    if [[ "$def" == o ]]; then hint="O/n"; else hint="o/N"; fi
+    ASKED=$((ASKED + 1))
+    while :; do
+        printf '[?] %s [%s] ' "$q" "$hint" >&2
+        IFS= read -r rep <&3 || die "Lecture du terminal impossible."
+        rep="$(trim "$rep")"; rep="${rep:-$def}"
+        case "${rep,,}" in
+            o|oui|y|yes) return 0 ;;
+            n|non|no)    return 1 ;;
+        esac
+        warn "Répondez o (oui) ou n (non)."
+    done
+}
+
+# Compte cible demandé : numéro de la liste ou nom (nouveau nom : création proposée ensuite).
+ask_target_user() {
+    local ans i
+    ASKED=$((ASKED + 1))
+    if (( ${#HUMANS[@]} )); then
+        printf '[?] Compte cible à configurer :\n' >&2
+        for i in "${!HUMANS[@]}"; do printf '    %d) %s\n' "$((i + 1))" "${HUMANS[$i]}" >&2; done
+    else
+        warn "Aucun compte humain (UID $UID_MIN-$UID_MAX avec shell) sur cette machine."
+    fi
+    while :; do
+        if (( ${#HUMANS[@]} )); then
+            printf '[?] Numéro, ou nom du compte (nouveau nom : création proposée) : ' >&2
+        else
+            printf '[?] Nom du compte à créer : ' >&2
+        fi
+        IFS= read -r ans <&3 || die "Lecture du terminal impossible."
+        ans="$(trim "$ans")"
+        if [[ "$ans" =~ ^[0-9]+$ ]] && (( ${#HUMANS[@]} )); then
+            if (( ans >= 1 && ans <= ${#HUMANS[@]} )); then
+                TARGET_USER="${HUMANS[$((ans - 1))]}"; return 0
+            fi
+        elif valid_name "$ans"; then
+            if ! user_exists "$ans" || is_human "$ans"; then
+                TARGET_USER="$ans"; return 0
+            fi
+            warn "'$ans' existe mais n'est pas un compte humain."
+            continue
+        fi
+        warn "Choix invalide : '$ans'"
+    done
+}
+
+# Clé publique SSH : « type base64 [commentaire] ». Le base64 doit se décoder en
+# une suite exacte de champs SSH (longueur sur 4 octets + données) dont le premier
+# est le type annoncé : une clé tronquée ou recollée de travers est refusée.
+SSH_KEY_TYPES='ssh-rsa|ssh-ed25519|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com'
+ssh_key_check() {
+    local type b64 comment hex type_hex len pos=0 n=0 first=""
+    read -r type b64 comment <<<"$1"
+    [[ "$type" =~ ^($SSH_KEY_TYPES)$ ]] || return 1
+    [[ "$b64" =~ ^[A-Za-z0-9+/]+={0,2}$ ]] || return 1
+    (( ${#b64} % 4 == 0 )) || return 1
+    hex="$(printf '%s' "$b64" | base64 -d 2>/dev/null | od -An -v -tx1 | tr -d ' \n')" || return 1
+    while (( pos < ${#hex} )); do
+        (( pos + 8 <= ${#hex} )) || return 1
+        len=$((16#${hex:pos:8})); pos=$((pos + 8))
+        (( pos + 2 * len <= ${#hex} )) || return 1
+        if (( n == 0 )); then first="${hex:pos:2*len}"; fi
+        pos=$((pos + 2 * len)); n=$((n + 1))
+    done
+    (( n >= 2 )) || return 1
+    type_hex="$(printf '%s' "$type" | od -An -v -tx1 | tr -d ' \n')"
+    [[ "$first" == "$type_hex" ]] || return 1
+    printf '%s %s%s' "$type" "$b64" "${comment:+ $comment}"
+}
+
+# Recolle une clé coupée sur plusieurs lignes : à chaque coupure, essaie « rien »
+# ou « une espace » (coupure dans le base64 ou entre deux champs), première
+# combinaison valide retenue. Affiche la clé normalisée sur une ligne.
+ssh_key_join() {
+    local -a parts=("$@")
+    local n=${#parts[@]} max=2 mask i cand
+    (( n > 0 )) || return 1
+    if (( n <= 8 )); then max=$((1 << (n - 1))); fi
+    for (( mask = 0; mask < max; mask++ )); do
+        cand="${parts[0]}"
+        for (( i = 1; i < n; i++ )); do
+            if (( n > 8 && mask == 1 )) || (( n <= 8 && (mask >> (i - 1)) & 1 )); then cand+=" "; fi
+            cand+="${parts[i]}"
+        done
+        ssh_key_check "$cand" && return 0
+    done
+    return 1
+}
+
+# Lit une clé publique dans un fichier (~ = HOME de l'administrateur qui a lancé sudo).
+ssh_key_from_file() {
+    local f="$1" home="$HOME" line
+    local -a lines=()
+    if [[ -n "${SUDO_USER:-}" ]]; then
+        home="$(getent passwd "$SUDO_USER" | cut -d: -f6)"; home="${home:-$HOME}"
+    fi
+    case "$f" in
+        "~")   f="$home" ;;
+        "~/"*) f="$home/${f#"~/"}" ;;
+    esac
+    if [[ ! -f "$f" || ! -r "$f" ]]; then
+        warn "Fichier introuvable ou illisible : $f"; return 1
+    fi
+    if grep -q 'PRIVATE KEY' "$f" 2>/dev/null; then
+        warn "$f est une clé PRIVÉE : elle ne doit jamais être copiée. Donnez la clé PUBLIQUE (fichier .pub)."; return 1
+    fi
+    if grep -q '^---- BEGIN SSH2 PUBLIC KEY' "$f" 2>/dev/null; then
+        warn "$f est au format RFC 4716 : convertissez-le (ssh-keygen -i -f $f) puis collez le résultat."; return 1
+    fi
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="$(trim "$line")"
+        [[ -z "$line" || "$line" == "#"* ]] || lines+=("$line")
+    done <"$f"
+    if ! ssh_key_join "${lines[@]}"; then
+        warn "$f : aucune clé publique valide (une seule clé attendue, format « type base64 [commentaire] »)."; return 1
+    fi
+}
+
+# Demande la clé publique : collage (éventuellement coupé en plusieurs lignes)
+# ou chemin d'un fichier .pub. Résultat dans SSH_KEY ; Entrée vide = aucune clé.
+ask_ssh_key() {
+    local first line key
+    local -a lines
+    while :; do
+        printf "[?] Collez la clé publique (ssh-ed25519 AAAA…), ou le chemin d'un fichier .pub (Entrée vide : aucune clé) :\n" >&2
+        IFS= read -r first <&3 || die "Lecture du terminal impossible."
+        first="$(trim "$first")"
+        if [[ -z "$first" ]]; then
+            warn "Aucune clé SSH ajoutée."; SSH_KEY=""; return 0
+        fi
+        if [[ "$first" == *"PRIVATE KEY"* ]]; then
+            # Le reste du collage (la clé privée) est jeté sans être affiché.
+            while IFS= read -r -t 0.5 _ <&3; do :; done
+            warn "Ceci est une clé PRIVÉE : elle ne doit jamais être collée ni copiée. Donnez la clé PUBLIQUE (.pub)."
+            continue
+        fi
+        if [[ "$first" =~ ^(ssh-|ecdsa-|sk-) ]]; then
+            lines=("$first")
+            # Le reste d'un collage multiligne arrive immédiatement.
+            while IFS= read -r -t 0.3 line <&3; do
+                line="$(trim "$line")"
+                [[ -n "$line" ]] || break
+                lines+=("$line")
+            done
+            until key="$(ssh_key_join "${lines[@]}")"; do
+                (( ${#lines[@]} < 20 )) || break
+                printf '[?] Clé incomplète ou invalide : collez la suite (Entrée vide : recommencer) :\n' >&2
+                IFS= read -r line <&3 || die "Lecture du terminal impossible."
+                line="$(trim "$line")"
+                [[ -n "$line" ]] || break
+                lines+=("$line")
+            done
+            if [[ -z "${key:-}" ]]; then
+                warn "Clé refusée : format attendu « type base64 [commentaire] », types ssh-ed25519, ssh-rsa, ecdsa-sha2-*, sk-ssh-* ; clé complète et non modifiée."
+                continue
+            fi
+        elif [[ "$first" == [/~.]* || "$first" == *.pub || -f "$first" ]]; then
+            key="$(ssh_key_from_file "$first")" || continue
+        else
+            warn "Ni une clé publique (ssh-ed25519 AAAA…, ssh-rsa, ecdsa-sha2-*, sk-ssh-*) ni un chemin de fichier : '$first'"
+            continue
+        fi
+        SSH_KEY="$key"
+        log "Clé retenue : $SSH_KEY"
+        return 0
+    done
+}
+
+# Compte inexistant : création selon --create-user / --no-create-user / question.
+resolve_missing_user() {
+    valid_name "$TARGET_USER" || die "--user '$TARGET_USER' : nom de compte invalide (attendu : [a-z_][a-z0-9_-]*)."
+    case "$CREATE_USER" in
+        never)
+            die "Le compte '$TARGET_USER' n'existe pas et --no-create-user interdit sa création." ;;
+        always)
+            CREATE_NEW=1 ;;
+        *)
+            if (( INTERACTIVE )); then
+                if ask_yn "Le compte $TARGET_USER n'existe pas. Le créer (adduser) ?" n; then
+                    CREATE_NEW=1
+                else
+                    die "Création refusée. Créez le compte (adduser $TARGET_USER) puis relancez, ou utilisez --create-user."
+                fi
+            elif (( ASSUME_YES )); then
+                die "Le compte '$TARGET_USER' n'existe pas et --yes ne le crée pas (réponse par défaut : non). Ajoutez --create-user."
+            else
+                die "Le compte '$TARGET_USER' n'existe pas. Relancez avec --create-user pour le créer, ou créez-le d'abord (adduser $TARGET_USER)."
+            fi ;;
+    esac
+}
+
 if [[ -n "$TARGET_USER" ]]; then
     if ! user_exists "$TARGET_USER"; then
-        # Nom inconnu : création possible (voir --create-user / --no-create-user).
-        valid_name "$TARGET_USER" || die "--user '$TARGET_USER' : nom de compte invalide (attendu : [a-z_][a-z0-9_-]*)."
-        case "$CREATE_USER" in
-            never)
-                die "Le compte '$TARGET_USER' n'existe pas et --no-create-user interdit sa création." ;;
-            always)
-                CREATE_NEW=1 ;;
-            *)
-                if [[ -t 0 || -t 2 ]] && { exec 3</dev/tty; } 2>/dev/null; then
-                    printf "[!] Le compte %s n'existe pas. Le créer (adduser, sans mot de passe) ? [o/N] " "$TARGET_USER" >&2
-                    IFS= read -r rep <&3 || rep=""
-                    exec 3<&-
-                    case "$rep" in
-                        o|O|oui|Oui|OUI|y|Y|yes) CREATE_NEW=1 ;;
-                        *) die "Création refusée. Créez le compte (adduser $TARGET_USER) puis relancez, ou utilisez --create-user." ;;
-                    esac
-                else
-                    die "Le compte '$TARGET_USER' n'existe pas. Relancez avec --create-user pour le créer, ou créez-le d'abord (adduser $TARGET_USER)."
-                fi ;;
-        esac
+        resolve_missing_user
     elif ! is_human "$TARGET_USER"; then
         die "--user '$TARGET_USER' existe mais n'est pas un compte humain (choix : ${HUMANS[*]:-aucun})."
     fi
@@ -535,20 +745,13 @@ elif (( EUID != 0 )) && is_human "$(id -un)"; then
     TARGET_USER="$(id -un)"; log "Compte cible : utilisateur courant $TARGET_USER"
 elif (( ${#HUMANS[@]} == 1 )); then
     TARGET_USER="${HUMANS[0]}"; log "Compte cible : unique compte humain $TARGET_USER"
+elif (( INTERACTIVE )); then
+    ask_target_user
+    user_exists "$TARGET_USER" || resolve_missing_user
 elif (( ${#HUMANS[@]} == 0 )); then
     die "Aucun compte humain (UID $UID_MIN-$UID_MAX avec shell) : créez-en un (adduser) puis relancez avec --user."
-elif [[ -t 0 || -t 2 ]] && { exec 3</dev/tty; } 2>/dev/null; then
-    printf '[+] Plusieurs comptes possibles :\n' >&2
-    for i in "${!HUMANS[@]}"; do printf '    %d) %s\n' "$((i + 1))" "${HUMANS[$i]}" >&2; done
-    while :; do
-        printf '[+] Numéro du compte à configurer : ' >&2
-        IFS= read -r ans <&3 || die "Lecture du terminal impossible."
-        if [[ "$ans" =~ ^[0-9]+$ ]] && (( ans >= 1 && ans <= ${#HUMANS[@]} )); then
-            TARGET_USER="${HUMANS[$((ans - 1))]}"; break
-        fi
-        warn "Choix invalide : '$ans'"
-    done
-    exec 3<&-
+elif (( ASSUME_YES )); then
+    die "--yes et compte cible ambigu (${HUMANS[*]}) : précisez --user NOM."
 else
     die "Mode non interactif et compte cible ambigu (${HUMANS[*]}) : précisez --user NOM."
 fi
@@ -573,12 +776,72 @@ if (( CREATE_NEW )); then
         PASSWORD_MODE=stdin
     elif (( NO_PASSWORD )); then
         PASSWORD_MODE=none
+    elif (( INTERACTIVE )); then
+        if ask_yn "Définir un mot de passe pour $TARGET_USER maintenant (saisie masquée par passwd) ?" o; then
+            PASSWORD_MODE=prompt
+        else
+            PASSWORD_MODE=none
+            warn "Sans mot de passe, $TARGET_USER sera verrouillé : connexion par clé SSH uniquement, sudo inutilisable."
+        fi
     elif [[ -t 0 || -t 2 ]]; then
-        PASSWORD_MODE=prompt
+        PASSWORD_MODE=prompt    # --yes : réponse par défaut « oui », saisie par passwd
     else
         die "Compte $TARGET_USER à créer : aucun mot de passe possible en non-interactif. Utilisez --password-stdin (recommandé), --password MDP, ou --no-password."
     fi
 fi
+
+# Clé SSH : seulement pour un compte créé ici (on ne modifie pas l'accès d'un
+# compte existant). Puis groupe sudo, si --sudo ne l'a pas déjà décidé.
+if [[ -n "$SSH_KEY_ARG" ]]; then
+    if (( ! CREATE_NEW )); then
+        warn "--ssh-key ignorée : $TARGET_USER existe déjà (ce script ne modifie l'accès que des comptes qu'il crée)."
+    elif [[ "$SSH_KEY_ARG" =~ ^(ssh-|ecdsa-|sk-) ]]; then
+        SSH_KEY="$(ssh_key_check "$(trim "$SSH_KEY_ARG")")" \
+            || die "--ssh-key : clé publique invalide (format « type base64 [commentaire] », types ssh-ed25519, ssh-rsa, ecdsa-sha2-*, sk-ssh-*)."
+    else
+        SSH_KEY="$(ssh_key_from_file "$SSH_KEY_ARG")" || die "--ssh-key : fichier refusé (voir ci-dessus)."
+    fi
+fi
+if (( CREATE_NEW && INTERACTIVE )); then
+    if [[ -z "$SSH_KEY_ARG" ]] && ask_yn "Ajouter une clé SSH publique au compte $TARGET_USER ?" n; then
+        ask_ssh_key
+    fi
+    if (( ! ADD_SUDO )) && ask_yn "Ajouter $TARGET_USER au groupe sudo ?" n; then
+        ADD_SUDO=1
+    fi
+    if (( ADD_SUDO )) && [[ "$PASSWORD_MODE" == none ]]; then
+        warn "$TARGET_USER sera dans le groupe sudo sans mot de passe : sudo restera inutilisable (sauf règle NOPASSWD)."
+    fi
+elif (( INTERACTIVE )); then
+    log "Compte existant $TARGET_USER : aucune clé SSH ajoutée (ce script ne modifie l'accès que des comptes qu'il crée)."
+fi
+
+# Récapitulatif soumis à confirmation dès qu'au moins une question a été posée.
+if (( INTERACTIVE && ASKED > 0 )); then
+    case "$PASSWORD_MODE" in
+        prompt) pw_choice="saisi maintenant par passwd (masqué)" ;;
+        none)   pw_choice="aucun (compte verrouillé, clé SSH uniquement)" ;;
+        param)  pw_choice="fourni par --password (non affiché)" ;;
+        stdin)  pw_choice="lu sur l'entrée standard (non affiché)" ;;
+        *)      pw_choice="inchangé" ;;
+    esac
+    step "Choix retenus"
+    if (( CREATE_NEW )); then
+        printf '    Compte          : %s (à créer, adduser)\n' "$TARGET_USER"
+        printf '    Mot de passe    : %s\n' "$pw_choice"
+        printf '    Clé SSH         : %s\n' "${SSH_KEY:-aucune}"
+        printf '    Groupe sudo     : %s\n' "$( (( ADD_SUDO )) && echo oui || echo non)"
+    else
+        printf '    Compte          : %s (existant, accès inchangé)\n' "$TARGET_USER"
+    fi
+    printf '    Docker rootful  : %s\n' "$( (( KEEP_ROOTFUL )) && echo "conservé" || echo "désactivé si présent")"
+    printf '    Test hello-world: %s\n' "$( (( NO_TEST )) && echo non || echo oui)"
+    if (( DRY_RUN )); then printf '    Mode            : --dry-run (rien ne sera écrit)\n'; fi
+    if ! ask_yn "Appliquer ?" o; then
+        die "Abandon à la demande : rien n'a été modifié."
+    fi
+fi
+if (( INTERACTIVE )); then exec 3<&-; fi
 
 if (( CREATE_NEW )); then
     step "0. Compte $TARGET_USER"
@@ -628,7 +891,7 @@ if (( CREATE_NEW )); then
                 passwd "$TARGET_USER"
             fi ;;
         none)
-            warn "Aucun mot de passe (--no-password) : $TARGET_USER est verrouillé pour l'authentification par mot de passe."
+            warn "Aucun mot de passe ($( (( NO_PASSWORD )) && echo "--no-password" || echo "choix au terminal")) : $TARGET_USER est verrouillé pour l'authentification par mot de passe."
             warn "Connexion uniquement par clé SSH ; sudo sera inutilisable pour ce compte tant qu'aucun mot de passe n'est défini." ;;
     esac
 
@@ -636,7 +899,7 @@ if (( CREATE_NEW )); then
         unset PASSWORD
     fi
 
-    if (( ! ADD_SUDO )) || [[ "$PASSWORD_MODE" == none ]]; then
+    if [[ -z "$SSH_KEY" ]] && { (( ! ADD_SUDO )) || [[ "$PASSWORD_MODE" == none ]]; }; then
         warn "Ajoutez une clé SSH à $TARGET_USER (depuis root) avant de compter vous y connecter."
     fi
 fi
@@ -647,6 +910,30 @@ else
     IFS=: read -r _ _ TARGET_UID TARGET_GID _ TARGET_HOME TARGET_SHELL < <(getent passwd "$TARGET_USER")
     [[ -n "${TARGET_UID:-}" ]] || die "Compte $TARGET_USER introuvable."
     [[ -d "$TARGET_HOME" ]] || die "Répertoire personnel de $TARGET_USER introuvable : $TARGET_HOME"
+fi
+
+# Clé SSH du compte créé : ~/.ssh (0700) et authorized_keys (0600) écrits EN TANT
+# QUE l'utilisateur (propriétaire correct, aucun lien suivi avec les droits root) ;
+# ajout seulement si la ligne exacte n'y figure pas déjà.
+if (( CREATE_NEW )) && [[ -n "$SSH_KEY" ]]; then
+    AUTH_KEYS="$TARGET_HOME/.ssh/authorized_keys"
+    if (( DRY_RUN )); then
+        log "(dry-run) ajout dans $AUTH_KEYS (~/.ssh 0700, fichier 0600, propriétaire $TARGET_USER) de : $SSH_KEY"
+    else
+        "$RUNUSER" -u "$TARGET_USER" -- sh -c '
+            umask 077
+            mkdir -p "$1" && chmod 0700 "$1" && touch "$1/authorized_keys" && chmod 0600 "$1/authorized_keys" || exit 1
+            if grep -qxF -- "$2" "$1/authorized_keys"; then exit 3; fi
+            if [ -s "$1/authorized_keys" ] && [ -n "$(tail -c 1 "$1/authorized_keys")" ]; then
+                echo >>"$1/authorized_keys"
+            fi
+            printf "%s\n" "$2" >>"$1/authorized_keys"' sh "$TARGET_HOME/.ssh" "$SSH_KEY" && key_rc=0 || key_rc=$?
+        case "$key_rc" in
+            0) log "Clé SSH ajoutée : $AUTH_KEYS ($(stat -c '%U %a' "$AUTH_KEYS"))" ;;
+            3) log "Clé SSH déjà présente dans $AUTH_KEYS : rien à faire." ;;
+            *) die "Échec de l'écriture de $AUTH_KEYS (code $key_rc)." ;;
+        esac
+    fi
 fi
 RUNTIME_DIR="/run/user/$TARGET_UID"
 SOCK="$RUNTIME_DIR/docker.sock"
@@ -916,6 +1203,8 @@ if (( CREATE_NEW )); then
         *)    pw_note="défini (non journalisé)" ;;
     esac
     created_note=" — compte créé par ce script, mot de passe : $pw_note"
+    if [[ -n "$SSH_KEY" ]]; then created_note+=", clé SSH ajoutée"; fi
+    if (( ADD_SUDO )); then created_note+=", groupe sudo"; fi
 fi
 cat <<EOF
 [+] Compte          : $TARGET_USER (uid $TARGET_UID)$created_note
