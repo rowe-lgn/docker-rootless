@@ -45,6 +45,7 @@ DOCKER_PKGS=(docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-c
 CONFLICT_PKGS=(docker.io docker-compose docker-doc docker-buildx podman-docker containerd runc)
 DOCKER_KEY=/etc/apt/keyrings/docker.asc
 DOCKER_SOURCES=/etc/apt/sources.list.d/docker.sources
+DOCKER_GPG_SRC=""            # --docker-key-file : cle GPG fournie localement (machine filtree)
 USER_SCRIPT_NAME=docker-rootless-user.sh
 
 # util-linux fournit runuser dans /usr/sbin, qui ne figure pas dans tous les PATH
@@ -118,6 +119,9 @@ Options :
                           le setuptool est alors lancé avec --force.
   --apt-suite CODENAME    Suite du dépôt Docker si VERSION_CODENAME n'y existe
                           pas (Debian testing/dérivées), ex. : trixie.
+  --docker-key-file FICH  Cle GPG du depot Docker deja telechargee (machine sans
+                          acces a download.docker.com). Copie typique :
+                          /etc/apt/keyrings/docker.asc d'une machine qui y accede.
   --print-user-script     Affiche le script utilisateur embarqué et quitte.
   -h, --help              Cette aide.
 EOF
@@ -468,6 +472,8 @@ while (( $# )); do
         --ssh-key=*)  SSH_KEY_ARG="${1#--ssh-key=}" ;;
         --apt-suite) [[ $# -ge 2 && -n "$2" ]] || die "--apt-suite attend un nom de suite"; APT_SUITE="$2"; shift ;;
         --apt-suite=*) APT_SUITE="${1#--apt-suite=}" ;;
+        --docker-key-file) [[ $# -ge 2 && -n "$2" ]] || die "--docker-key-file attend un chemin"; DOCKER_GPG_SRC="$2"; shift ;;
+        --docker-key-file=*) DOCKER_GPG_SRC="${1#--docker-key-file=}" ;;
         --print-user-script) user_script_content; exit 0 ;;
         -h|--help)    usage; exit 0 ;;
         *) usage >&2; die "Option inconnue : $1" ;;
@@ -492,6 +498,7 @@ fi
 
 (( DRY_RUN )) && log "Mode --dry-run : aucune modification ne sera faite."
 [[ -r /etc/debian_version ]] || warn "Ce script cible Debian ; /etc/debian_version introuvable."
+[[ -z "$DOCKER_GPG_SRC" || -s "$DOCKER_GPG_SRC" ]] || die "--docker-key-file : fichier absent ou vide : $DOCKER_GPG_SRC"
 command -v systemctl >/dev/null 2>&1 || die "systemd requis (systemctl introuvable)."
 
 # ---------------------------------------------------------------------------
@@ -943,10 +950,68 @@ log "Compte : $TARGET_USER (uid $TARGET_UID), HOME=$TARGET_HOME"
 pkg_state() { dpkg-query -W -f='${db:Status-Abbrev}' "$1" 2>/dev/null | tr -d ' ' || true; }
 pkg_installed() { [[ "$(pkg_state "$1")" == "ii" ]]; }
 
-APT=(apt-get -y -o DPkg::Lock::Timeout=300)
+# Tous les appels reseau sont bornes : un pare-feu qui bloque doit produire une
+# erreur claire en quelques secondes, jamais un script qui semble fige.
+APT=(apt-get -y -o DPkg::Lock::Timeout=120 -o Acquire::http::Timeout=20
+     -o Acquire::https::Timeout=20 -o Acquire::Retries=2)
+CURL_OPTS=(--connect-timeout 10 --max-time 60 --retry 1 --retry-delay 2)
 export DEBIAN_FRONTEND=noninteractive
 APT_UPDATED=0
-apt_update_once() { (( APT_UPDATED )) && return 0; run "${APT[@]}" update; APT_UPDATED=1; }
+apt_update_once() {
+    (( APT_UPDATED )) && return 0
+    log "Mise a jour des index APT (borne a 5 min)..."
+    run timeout 300 "${APT[@]}" update || die "apt-get update a echoue ou depasse 5 min (reseau, pare-feu ou miroir APT)."
+    APT_UPDATED=1
+}
+
+# Le depot officiel est servi via un CDN CloudFront : un whitelist par nom ne
+# suffit pas toujours. On teste AVANT d'ecrire quoi que ce soit.
+verifier_acces_download_docker() {
+    local code
+    code="$(timeout 25 curl -sS -o /dev/null -m 20 -w '%{http_code}' \
+        https://download.docker.com/linux/debian/gpg 2>/dev/null)" || code="000"
+    if [[ "$code" == "200" ]]; then
+        log "Acces a download.docker.com : OK (HTTP 200)."
+        return 0
+    fi
+    warn "download.docker.com injoignable (code HTTP « $code ») : le pare-feu de cette machine le bloque."
+    warn "Le depot est servi par un CDN (*.cloudfront.net) : autorise le nom ET le CDN, ou"
+    warn "fournis la cle GPG a la main avec --docker-key-file <fichier docker.asc>."
+    return 1
+}
+
+# Ecrit la cle GPG du depot dans DOCKER_KEY : depuis un fichier local si fourni,
+# sinon par telechargement borne.
+recuperer_cle_docker() {
+    if [[ -n "$DOCKER_GPG_SRC" ]]; then
+        [[ -s "$DOCKER_GPG_SRC" ]] || die "--docker-key-file : fichier absent ou vide : $DOCKER_GPG_SRC"
+        if (( DRY_RUN )); then
+            printf '[+] (dry-run) installerait %s -> %s\n' "$DOCKER_GPG_SRC" "$DOCKER_KEY"
+        else
+            install -m 0755 -d /etc/apt/keyrings
+            install -m 0644 "$DOCKER_GPG_SRC" "$DOCKER_KEY"
+            log "Cle GPG Docker installee depuis $DOCKER_GPG_SRC."
+        fi
+        return 0
+    fi
+    if (( DRY_RUN )); then
+        printf '[+] (dry-run) telechargerait la cle GPG depuis https://download.docker.com/linux/debian/gpg\n'
+        return 0
+    fi
+    log "Telechargement de la cle GPG Docker (~4 Ko, borne a 60 s)..."
+    install -m 0755 -d /etc/apt/keyrings
+    if ! timeout 90 curl -fsSL "${CURL_OPTS[@]}" -o "$DOCKER_KEY" \
+            https://download.docker.com/linux/debian/gpg; then
+        rm -f "$DOCKER_KEY"
+        err "Telechargement de la cle GPG impossible (pare-feu ou reseau)."
+        err "  1) autorise download.docker.com (et son CDN *.cloudfront.net) sur cette machine, ou"
+        err "  2) copie la cle depuis une machine qui y accede, puis relance avec :"
+        err "       --docker-key-file /chemin/docker.asc"
+        die "Etape cle GPG interrompue : rien n'a ete modifie."
+    fi
+    chmod a+r "$DOCKER_KEY"
+    log "Cle GPG Docker installee : $DOCKER_KEY"
+}
 
 # ---------------------------------------------------------------------------
 step "1. Prérequis système"
@@ -1038,10 +1103,8 @@ if (( ${#repo_files[@]} )); then
         if [[ -s "$k" ]]; then
             log "Clé du dépôt présente : $k"
         elif [[ "$k" == "$DOCKER_KEY" ]]; then
-            warn "Clé $k absente : téléchargement selon [D]."
-            run install -m 0755 -d /etc/apt/keyrings
-            run curl -fsSL https://download.docker.com/linux/debian/gpg -o "$DOCKER_KEY"
-            run chmod a+r "$DOCKER_KEY"
+            warn "Clé $k absente."
+            recuperer_cle_docker
             APT_UPDATED=0
         else
             warn "Clé $k référencée par le dépôt mais absente : à corriger manuellement."
@@ -1051,10 +1114,9 @@ else
     suite="${APT_SUITE:-$(. /etc/os-release && echo "${VERSION_CODENAME:-}")}"
     [[ -n "$suite" ]] || die "VERSION_CODENAME vide : précisez --apt-suite (ex. trixie), cf. note Debian testing de [D]."
     log "Ajout du dépôt Docker (suite '$suite') dans $DOCKER_SOURCES"
-    pkg_installed ca-certificates && pkg_installed curl || { apt_update_once; run "${APT[@]}" install ca-certificates curl; }
-    run install -m 0755 -d /etc/apt/keyrings
-    run curl -fsSL https://download.docker.com/linux/debian/gpg -o "$DOCKER_KEY"
-    run chmod a+r "$DOCKER_KEY"
+    verifier_acces_download_docker || true
+    pkg_installed ca-certificates && pkg_installed curl || { apt_update_once; run timeout 300 "${APT[@]}" install ca-certificates curl || die "installation de ca-certificates/curl impossible."; }
+    recuperer_cle_docker
     sources_content="Types: deb
 URIs: https://download.docker.com/linux/debian
 Suites: $suite
@@ -1087,7 +1149,7 @@ if (( ${#need[@]} )); then
     log "À installer : ${need[*]}"
     [[ " ${need[*]} " == *" docker-ce "* ]] && log "Note : le postinst de docker-ce démarre le démon rootful ; il sera désactivé à l'étape 4 (sauf --keep-rootful-docker)."
     apt_update_once
-    run "${APT[@]}" install "${need[@]}"
+    run timeout 900 "${APT[@]}" install "${need[@]}" || die "installation des paquets Docker impossible (reseau, pare-feu ou depot)."
 else
     log "Déjà installés : ${DOCKER_PKGS[*]}"
 fi
